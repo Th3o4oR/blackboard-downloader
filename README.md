@@ -39,15 +39,10 @@ uv run blackboard-downloader
 The script will ask for:
 1. Your Blackboard domain (e.g. `learn.bu.edu`)
 2. Which term to download
+3. Whether to filter courses or download them all
+4. Whether to download only new files, or download all files
 
 ### Command-line flags
-
-```bash
-python3 bb_downloader.py \
-  --url learn.bu.edu \
-  --output ~/Desktop/Blackboard \
-  --ext .pdf .pptx .docx
-```
 
 | Flag | Description | Default |
 |------|-------------|---------|
