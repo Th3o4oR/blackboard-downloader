@@ -6,6 +6,7 @@ Automatically download course files from any **Blackboard Learn** instance. Supp
 
 - Works with any Blackboard Learn school (just enter your domain)
 - Lists all your terms and lets you pick which one to download
+- Pick exactly which modules to download (or use `--courses` to script it)
 - Preserves top-level folder structure from Blackboard
 - Skips files you've already downloaded
 - Supports any file type: PDF, PPTX, DOCX, etc.
@@ -39,7 +40,7 @@ uv run blackboard-downloader
 The script will ask for:
 1. Your Blackboard domain (e.g. `learn.bu.edu`)
 2. Which term to download
-3. Whether to filter courses or download them all
+3. Which modules within that term (e.g. `1,3,5` or `1-3` or `all`)
 4. Whether to download only new files, or download all files
 
 ### Command-line flags
@@ -49,9 +50,10 @@ The script will ask for:
 | `--url` | Blackboard domain | prompted |
 | `--output` | Download folder | `~/Downloads/Blackboard` |
 | `--ext` | File extensions | `.pdf .pptx .docx .zip .py .ipynb .cpp .h .c .m .tex` |
+| `--courses` | Course names/IDs to download (substring match). Skips the interactive picker. | prompted |
 | `--concurrent-collection` | Number of concurrent workers for file discovery | `5` |
 | `--concurrent-downloads` | Number of concurrent workers for downloads | `5` |
--v
+
 ### Output structure
 
 ```
@@ -80,7 +82,7 @@ Blackboard/
 
 - **Re-running is safe** — already downloaded files are skipped
 - **External links are not downloaded** (e.g. files hosted on Google Drive or OneDrive)
-- Tested on Blackboard Learn SaaS (Ultra experience) at Boston University (learn.bu.edu)
+- Tested on Blackboard Learn SaaS (Ultra experience) at Boston University (learn.bu.edu) and Trinity College Dublin (tcd.blackboard.com)
 
 ## Contributing
 

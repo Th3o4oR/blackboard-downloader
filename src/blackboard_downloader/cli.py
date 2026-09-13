@@ -42,7 +42,11 @@ CONTAINER_HANDLERS = {
     "resource/x-bb-blankpage",
 }
 
-DEFAULT_EXTENSIONS = {".pdf"}
+# Nodes that should create a subfolder on disk when recursed into.
+FOLDER_HANDLERS = {
+    "resource/x-bb-folder",
+    "resource/x-bb-lesson",
+}
 
 
 # ── Auth & Networking ─────────────────────────────────────────────────────────
@@ -192,12 +196,86 @@ def pick_term(term_map):
             all_courses = [c for courses in term_map.values() for c in courses]
             return all_courses
         if raw.isdigit() and 1 <= int(raw) <= len(terms):
-            selected = term_map[terms[int(raw) - 1]]
-            print("\nCourses in selected term:")
-            for c in selected:
-                print(f"  - {c['name']}")
-            return selected
+            return term_map[terms[int(raw) - 1]]
         print("  Invalid input, try again.")
+
+
+def pick_courses(courses):
+    """
+    Interactive multi-select course picker.
+    Accepts: 'all' / blank, comma-separated indices, hyphen ranges, or a mix
+    (e.g. '1,3,5', '1-3', '1-3,5,7-9'). Returns the chosen subset in original order.
+    """
+    print("\nCourses in selected term:")
+    for i, c in enumerate(courses, 1):
+        print(f"  [{i}] {c['name']}")
+    print("\nEnter course numbers to download (e.g. 1,3,5 or 1-3,5).")
+    print("Press Enter or type 'all' for every course.")
+
+    while True:
+        raw = input("  > ").strip().lower()
+        if raw == "" or raw == "all":
+            return courses
+
+        chosen = set()
+        ok = True
+        for token in raw.split(","):
+            token = token.strip()
+            if not token:
+                continue
+            if "-" in token:
+                parts = token.split("-")
+                if len(parts) != 2 or not parts[0].isdigit() or not parts[1].isdigit():
+                    ok = False
+                    break
+                a, b = int(parts[0]), int(parts[1])
+                if a > b:
+                    a, b = b, a
+                for n in range(a, b + 1):
+                    if not 1 <= n <= len(courses):
+                        ok = False
+                        break
+                    chosen.add(n)
+                if not ok:
+                    break
+            else:
+                if not token.isdigit():
+                    ok = False
+                    break
+                n = int(token)
+                if not 1 <= n <= len(courses):
+                    ok = False
+                    break
+                chosen.add(n)
+
+        if not ok or not chosen:
+            print("  Invalid input, try again.")
+            continue
+
+        selected = [courses[i - 1] for i in sorted(chosen)]
+        print("\nSelected courses:")
+        for c in selected:
+            print(f"  - {c['name']}")
+        return selected
+
+
+def filter_courses_by_query(courses, queries):
+    """Filter courses by case-insensitive substring match against name or course code."""
+    queries_lc = [q.lower() for q in queries]
+    matched = []
+    seen_match = {q: False for q in queries_lc}
+    for c in courses:
+        name_lc = c["name"].lower()
+        code_lc = c.get("course_code", "").lower()
+        for q in queries_lc:
+            if q in name_lc or q in code_lc:
+                matched.append(c)
+                seen_match[q] = True
+                break
+    for q, hit in seen_match.items():
+        if not hit:
+            print(f"  Warning: no course matched '{q}'")
+    return matched
 
 
 # ── Content traversal ─────────────────────────────────────────────────────────
@@ -225,11 +303,12 @@ def collect_files_recursive(
 ):
     """
     Recursively collect all downloadable files under item_id.
-    Returns list of {"url": ..., "filename": ...}
+    Returns list of {"url": ..., "filename": ..., "rel_path": [folder, subfolder, ...]}
+    where rel_path mirrors the Blackboard folder/lesson hierarchy below item_id.
     """
     files = []
 
-    def fetch(node_id):
+    def fetch(node_id, rel_path):
         if call_counter is not None:
             call_counter[0] += 1
         detail_resp = session.get(
@@ -237,7 +316,9 @@ def collect_files_recursive(
         )
         if detail_resp.status_code == 200:
             body = detail_resp.json().get("body", "")
-            files.extend(_extract_from_body(body, base_url, extensions))
+            for f in _extract_from_body(body, base_url, extensions):
+                f["rel_path"] = list(rel_path)
+                files.append(f)
 
         if call_counter is not None:
             call_counter[0] += 1
@@ -253,7 +334,13 @@ def collect_files_recursive(
                         f"{base_url}/learn/api/public/v1/courses/{course_id}"
                         f"/contents/{node_id}/attachments/{att['id']}/download"
                     )
-                    files.append({"url": dl_url, "filename": filename})
+                    files.append(
+                        {
+                            "url": dl_url,
+                            "filename": filename,
+                            "rel_path": list(rel_path),
+                        }
+                    )
 
         if call_counter is not None:
             call_counter[0] += 1
@@ -262,9 +349,17 @@ def collect_files_recursive(
         )
         if children_resp.status_code == 200:
             for child in children_resp.json().get("results", []):
-                fetch(child.get("id"))
+                child_id = child.get("id")
+                if not child_id:
+                    continue
+                handler = (child.get("contentHandler") or {}).get("id", "")
+                if handler in FOLDER_HANDLERS:
+                    child_name = _safe(child.get("title", "Untitled"))
+                    fetch(child_id, rel_path + [child_name])
+                else:
+                    fetch(child_id, rel_path)
 
-    fetch(item_id)
+    fetch(item_id, [])
     return files
 
 
@@ -328,6 +423,7 @@ def parse_args():
 Examples:
   python3 bb_downloader.py
   python3 bb_downloader.py --url learn.bu.edu --output ~/Desktop/BB --ext .pdf .pptx
+  python3 bb_downloader.py --courses CSU33012 "Machine Learning"
         """,
     )
     parser.add_argument(
@@ -360,6 +456,15 @@ Examples:
         help=(
             "File extensions to download, e.g. --ext .pdf .pptx .docx"
             "(default: .pdf .pptx .docx .zip .py .ipynb .cpp .h .c .m .tex)"
+        ),
+    )
+    parser.add_argument(
+        "--courses",
+        nargs="+",
+        default=None,
+        help=(
+            "Course names or IDs to download (substring match, case-insensitive). "
+            "Skips the interactive course picker. Example: --courses CSU33012 'Machine Learning'"
         ),
     )
     parser.add_argument(
@@ -434,34 +539,13 @@ def main():
         return
 
     courses = pick_term(term_map)
-
-    # Filter courses
-    print(f"\nSelected term contains {len(courses)} course(s).")
-    raw_query = (
-        input(
-            "Enter search terms (comma or space separated) to filter by name/code (leave empty for all): "
-        )
-        .strip()
-        .lower()
-    )
-
-    if raw_query:
-        query_terms = raw_query.replace(",", " ").split()
-        filtered_courses = []
-        for c in courses:
-            c_name = c["name"].lower()
-            c_code = c["course_code"].lower()
-            if any(term in c_name or term in c_code for term in query_terms):
-                filtered_courses.append(c)
-
-        if not filtered_courses:
-            print("No courses matched your filter. Exiting.")
+    if args.courses:
+        courses = filter_courses_by_query(courses, args.courses)
+        if not courses:
+            print("No courses matched --courses filter.")
             return
-
-        courses = filtered_courses
-        print(f"\nFiltered down to {len(courses)} course(s):")
-        for c in courses:
-            print(f"  - {c['name']}")
+    else:
+        courses = pick_courses(courses)
 
     # ── Phase 1: Concurrent Collection of Links ───────────────────────────────────
 
@@ -538,7 +622,10 @@ def main():
                                 call_counter=call_counter,
                             )
                             for f in files:
-                                dest = section_dir / _safe(f["filename"])
+                                subdirs = [_safe(p) for p in f.get("rel_path", []) if p]
+                                dest = section_dir.joinpath(
+                                    *subdirs, _safe(f["filename"])
+                                )
                                 tasks_found.append(
                                     {
                                         "url": f["url"],
