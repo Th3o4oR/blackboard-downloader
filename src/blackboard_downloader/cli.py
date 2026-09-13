@@ -553,11 +553,11 @@ def main():
                     collection_progress.advance(master_task)
 
                     # Update master description with accurate completion counts
-                    completed = collection_progress.tasks[master_task].completed
-                    total = collection_progress.tasks[master_task].total
+                    completed = int(collection_progress.tasks[master_task].completed)
+                    total = int(collection_progress.tasks[master_task].total or 0)
                     collection_progress.update(
                         master_task,
-                        description=f"[bold green]Overall Collection ({int(completed)}/{int(total)} courses)",
+                        description=f"[bold green]Overall Collection ({completed}/{total} courses)",
                     )
 
             with ThreadPoolExecutor(max_workers=num_scanners) as executor:
