@@ -2,6 +2,9 @@
 Blackboard Learn PDF Downloader
 Supports any school running Blackboard Learn.
 Usage: python3 bb_downloader.py
+
+Requires:
+  pip install requests beautifulsoup4 playwright rich
 """
 
 import argparse
@@ -11,12 +14,22 @@ import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from queue import Queue
 from urllib.parse import unquote, urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
-from tqdm import tqdm
+from rich.console import Console
+from rich.progress import (
+    BarColumn,
+    DownloadColumn,
+    Progress,
+    SpinnerColumn,
+    TextColumn,
+    TimeRemainingColumn,
+    TransferSpeedColumn,
+)
 
 CONTAINER_HANDLERS = {
     "resource/x-bb-folder",
@@ -290,37 +303,6 @@ def _matches(filename, mime, extensions):
     return mime_map.get(mime, "") in extensions
 
 
-# ── Download ──────────────────────────────────────────────────────────────────
-
-
-def download_file(session, url, dest_path: Path, overwrite=False):
-    """
-    Downloads a file. Returns True if downloaded, False if skipped/failed.
-    """
-    if dest_path.exists() and not overwrite:
-        return False
-
-    resp = session.get(url, stream=True, allow_redirects=True)
-    if resp.status_code != 200:
-        tqdm.write(f"Failed ({resp.status_code}): {dest_path.name}")
-        return False
-
-    cd = resp.headers.get("Content-Disposition", "")
-    if cd and "filename=" in cd:
-        m = re.search(r'filename[^;=\n]*=([\'"]?)([^\'";\n]+)\1', cd)
-        if m:
-            real_name = m.group(2).strip()
-            if Path(real_name).suffix:
-                dest_path = dest_path.parent / _safe(real_name)
-
-    dest_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(dest_path, "wb") as f:
-        for chunk in resp.iter_content(chunk_size=8192):
-            if chunk:
-                f.write(chunk)
-    return True
-
-
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 
@@ -385,6 +367,7 @@ def prompt_url():
 
 def main():
     args = parse_args()
+    console = Console()
 
     base_url = args.url
     if base_url:
@@ -442,43 +425,58 @@ def main():
 
     # Print table header
     header = f"{'Course Name':<{max_name_len}} | {'Files Discovered':>16} | {'Links Visited':>13} | {'Time':>8} | {'Avg Load':>9}"
-    print(header)
-    print("-" * len(header))
+    console.print(header, style="bold")
+    console.print("-" * len(header))
+
+    # Phase 1 Rich Progress
+    collection_progress = Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+        TextColumn("({task.completed}/{task.total} courses)"),
+        console=console,
+    )
 
     try:
-        for course in tqdm(courses, desc="Collecting Courses", unit="course"):
-            course_start_time = time.time()
-            start_calls = session.api_calls
+        with collection_progress:
+            task_id = collection_progress.add_task("Collecting...", total=len(courses))
 
-            course_dir = output_dir / course["safe_name"]
-            sections = get_top_level_sections(session, base_url, course["id"])
+            for course in courses:
+                course_start_time = time.time()
+                start_calls = session.api_calls
 
-            found_for_course = 0
-            if sections:
-                for section in sections:
-                    section_dir = course_dir / section["name"]
-                    files = collect_files_recursive(
-                        session, base_url, course["id"], section["id"], extensions
-                    )
-                    for f in files:
-                        dest = section_dir / _safe(f["filename"])
-                        download_tasks.append(
-                            {
-                                "url": f["url"],
-                                "dest": dest,
-                                "course": course["name"],
-                                "section": section["name"],
-                            }
+                course_dir = output_dir / course["safe_name"]
+                sections = get_top_level_sections(session, base_url, course["id"])
+
+                found_for_course = 0
+                if sections:
+                    for section in sections:
+                        section_dir = course_dir / section["name"]
+                        files = collect_files_recursive(
+                            session, base_url, course["id"], section["id"], extensions
                         )
-                        found_for_course += 1
+                        for f in files:
+                            dest = section_dir / _safe(f["filename"])
+                            download_tasks.append(
+                                {
+                                    "url": f["url"],
+                                    "dest": dest,
+                                    "course": course["name"],
+                                    "section": section["name"],
+                                }
+                            )
+                            found_for_course += 1
 
-            course_time = time.time() - course_start_time
-            course_calls = session.api_calls - start_calls
-            avg_load = (course_time / course_calls) if course_calls > 0 else 0
+                course_time = time.time() - course_start_time
+                course_calls = session.api_calls - start_calls
+                avg_load = (course_time / course_calls) if course_calls > 0 else 0
 
-            # Print stats directly above the progress bar as a table row
-            row = f"{course['name']:<{max_name_len}} | {found_for_course:>16} | {course_calls:>13} | {course_time:>7.1f}s | {avg_load:>8.2f}s"
-            tqdm.write(row)
+                # Print stats cleanly above the progress bar
+                row = f"{course['name']:<{max_name_len}} | {found_for_course:>16} | {course_calls:>13} | {course_time:>7.1f}s | {avg_load:>8.2f}s"
+                collection_progress.console.print(row)
+
+                collection_progress.advance(task_id)
 
     except KeyboardInterrupt:
         print("\nCollection interrupted. Proceeding with what was found.")
@@ -489,7 +487,6 @@ def main():
 
     new_files = []
     existing_files = []
-    # summary structure: dict[course][section] = {"new": 0, "existing": 0}
     summary = defaultdict(lambda: defaultdict(lambda: {"new": 0, "existing": 0}))
 
     for task in download_tasks:
@@ -541,34 +538,121 @@ def main():
         print("No files to download. Exiting.")
         return
 
-    # ── Phase 3: Download ─────────────────────────────────────────────────────
+    # ── Phase 3: Concurrent Downloads ─────────────────────────
 
     print(
-        f"\nStarting {len(tasks_to_run)} download(s) using {args.concurrent_downloads} workers..."
+        f"\nStarting {len(tasks_to_run)} download(s) using {args.concurrent_downloads} workers...\n"
     )
     download_start = time.time()
     success_count = 0
     failure_count = 0
 
-    try:
-        with ThreadPoolExecutor(max_workers=args.concurrent_downloads) as executor:
-            futures = {
-                executor.submit(
-                    download_file, session, task["url"], task["dest"], overwrite
-                ): task
-                for task in tasks_to_run
-            }
+    # UI setup for Pattern 1 (Fixed slots)
+    dl_progress = Progress(
+        TextColumn("[bold blue]{task.description}", justify="right"),
+        BarColumn(bar_width=None),
+        "[progress.percentage]{task.percentage:>3.1f}%",
+        "•",
+        DownloadColumn(),
+        "•",
+        TransferSpeedColumn(),
+        "•",
+        TimeRemainingColumn(),
+        console=console,
+    )
 
-            for future in tqdm(
-                as_completed(futures),
-                total=len(futures),
-                desc="Downloading",
-                unit="file",
-            ):
-                if future.result():
-                    success_count += 1
-                else:
-                    failure_count += 1
+    try:
+        with dl_progress:
+            # 1. Master task for overall progress
+            master_task = dl_progress.add_task(
+                "[bold green]Overall Progress", total=len(tasks_to_run)
+            )
+
+            # 2. Worker tasks (fixed slots). We use a thread-safe Queue to distribute these UI slots.
+            worker_slots = Queue()
+            for i in range(args.concurrent_downloads):
+                # Hidden until a thread picks it up
+                task_id = dl_progress.add_task("", visible=False)
+                worker_slots.put(task_id)
+
+            def download_worker(task):
+                """Wrapper function run by the thread pool that handles the UI slot assignment."""
+                dest_path = task["dest"]
+                url = task["url"]
+
+                if dest_path.exists() and not overwrite:
+                    dl_progress.advance(master_task)
+                    return False
+
+                # Claim a UI slot
+                slot_id = worker_slots.get()
+
+                # Format name for display
+                display_name = dest_path.name
+                if len(display_name) > 30:
+                    display_name = display_name[:27] + "..."
+
+                dl_progress.update(
+                    slot_id,
+                    description=f"[cyan]{display_name}",
+                    visible=True,
+                    completed=0,
+                    total=None,
+                )
+
+                success = False
+                try:
+                    resp = session.get(url, stream=True, allow_redirects=True)
+                    if resp.status_code == 200:
+                        # Handle content disposition for real filename
+                        cd = resp.headers.get("Content-Disposition", "")
+                        if cd and "filename=" in cd:
+                            m = re.search(
+                                r'filename[^;=\n]*=([\'"]?)([^\'";\n]+)\1', cd
+                            )
+                            if m:
+                                real_name = m.group(2).strip()
+                                if Path(real_name).suffix:
+                                    dest_path = dest_path.parent / _safe(real_name)
+
+                        dest_path.parent.mkdir(parents=True, exist_ok=True)
+
+                        # Get total size for progress bar tracking
+                        total_size = int(resp.headers.get("Content-Length", 0)) or None
+                        dl_progress.update(slot_id, total=total_size)
+
+                        with open(dest_path, "wb") as f:
+                            for chunk in resp.iter_content(chunk_size=8192):
+                                if chunk:
+                                    f.write(chunk)
+                                    dl_progress.advance(slot_id, len(chunk))
+                        success = True
+                    else:
+                        dl_progress.console.print(
+                            f"[red]Failed ({resp.status_code}): {display_name}[/red]"
+                        )
+
+                except Exception as e:
+                    dl_progress.console.print(
+                        f"[red]Error downloading {display_name}: {e}[/red]"
+                    )
+
+                finally:
+                    # Release the slot and update master progress
+                    dl_progress.update(slot_id, visible=False)
+                    worker_slots.put(slot_id)
+                    dl_progress.advance(master_task)
+
+                return success
+
+            # Run downloads concurrently
+            with ThreadPoolExecutor(max_workers=args.concurrent_downloads) as executor:
+                futures = {executor.submit(download_worker, t): t for t in tasks_to_run}
+                for future in as_completed(futures):
+                    if future.result():
+                        success_count += 1
+                    else:
+                        failure_count += 1
 
     except KeyboardInterrupt:
         print("\nDownloads interrupted.")
