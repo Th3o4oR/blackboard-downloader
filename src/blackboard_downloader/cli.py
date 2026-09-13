@@ -10,6 +10,7 @@ Requires:
 import argparse
 import json
 import re
+import threading
 import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -45,14 +46,16 @@ DEFAULT_EXTENSIONS = {".pdf"}
 
 
 class TrackedSession:
-    """Wraps requests.Session to track the number of API calls made."""
+    """Wraps requests.Session to track the number of API calls made in a thread-safe way."""
 
     def __init__(self, session):
         self.session = session
         self.api_calls = 0
+        self._lock = threading.Lock()
 
     def get(self, *args, **kwargs):
-        self.api_calls += 1
+        with self._lock:
+            self.api_calls += 1
         return self.session.get(*args, **kwargs)
 
     def __getattr__(self, name):
@@ -214,7 +217,9 @@ def get_top_level_sections(session, base_url, course_id):
     return sections
 
 
-def collect_files_recursive(session, base_url, course_id, item_id, extensions):
+def collect_files_recursive(
+    session, base_url, course_id, item_id, extensions, call_counter=None
+):
     """
     Recursively collect all downloadable files under item_id.
     Returns list of {"url": ..., "filename": ...}
@@ -222,6 +227,8 @@ def collect_files_recursive(session, base_url, course_id, item_id, extensions):
     files = []
 
     def fetch(node_id):
+        if call_counter is not None:
+            call_counter[0] += 1
         detail_resp = session.get(
             f"{base_url}/learn/api/public/v1/courses/{course_id}/contents/{node_id}"
         )
@@ -229,6 +236,8 @@ def collect_files_recursive(session, base_url, course_id, item_id, extensions):
             body = detail_resp.json().get("body", "")
             files.extend(_extract_from_body(body, base_url, extensions))
 
+        if call_counter is not None:
+            call_counter[0] += 1
         att_resp = session.get(
             f"{base_url}/learn/api/public/v1/courses/{course_id}/contents/{node_id}/attachments"
         )
@@ -243,6 +252,8 @@ def collect_files_recursive(session, base_url, course_id, item_id, extensions):
                     )
                     files.append({"url": dl_url, "filename": filename})
 
+        if call_counter is not None:
+            call_counter[0] += 1
         children_resp = session.get(
             f"{base_url}/learn/api/public/v1/courses/{course_id}/contents/{node_id}/children?limit=100"
         )
@@ -354,6 +365,12 @@ Examples:
         default=5,
         help="Maximum number of concurrent downloads (default: 5)",
     )
+    parser.add_argument(
+        "--concurrent-collection",
+        type=int,
+        default=5,
+        help="Maximum number of concurrent course scanners (default: 5)",
+    )
     return parser.parse_args()
 
 
@@ -426,15 +443,11 @@ def main():
     )
 
     if raw_query:
-        # Replace commas with spaces, then split by whitespace to get individual terms
         query_terms = raw_query.replace(",", " ").split()
-
         filtered_courses = []
         for c in courses:
             c_name = c["name"].lower()
             c_code = c["course_code"].lower()
-
-            # If ANY of the query terms match the course name or code, include it
             if any(term in c_name or term in c_code for term in query_terms):
                 filtered_courses.append(c)
 
@@ -447,73 +460,130 @@ def main():
         for c in courses:
             print(f"  - {c['name']}")
 
-    # ── Phase 1: Collect Links ────────────────────────────────────────────────
+    # ── Phase 1: Concurrent Collection of Links ───────────────────────────────────
 
-    print(f"\nGathering file links for {len(courses)} course(s)...\n")
+    num_scanners = min(args.concurrent_collection, len(courses))
+    print(f"\nGathering file links for {len(courses)} course(s)\n")
     download_tasks = []
     total_collection_start = time.time()
 
-    max_name_len = max((len(c["name"]) for c in courses), default=11)
+    course_stats = []
 
-    # Print table header
-    header = f"{'Course Name':<{max_name_len}} | {'Files Discovered':>16} | {'Links Visited':>13} | {'Time':>8} | {'Avg Load':>9}"
-    console.print(header, style="bold", highlight=False)
-    console.print("-" * len(header), highlight=False)
-
-    # Phase 1 Rich Progress
+    # UI setup: simplified view for dynamic crawling length
     collection_progress = Progress(
         SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
-        TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
-        TextColumn("({task.completed}/{task.total} courses)"),
+        TextColumn("[bold blue]{task.description}"),
+        BarColumn(bar_width=None),
         console=console,
     )
 
     try:
         with collection_progress:
-            task_id = collection_progress.add_task("Collecting...", total=len(courses))
+            master_task = collection_progress.add_task(
+                f"[bold green]Overall Collection (0/{len(courses)} courses)",
+                total=len(courses),
+            )
 
-            for course in courses:
-                course_start_time = time.time()
-                start_calls = session.api_calls
+            worker_slots = Queue()
+            for _ in range(num_scanners):
+                # Worker tasks get total=None to naturally render a pulsing bar
+                task_id = collection_progress.add_task("", visible=False)
+                worker_slots.put(task_id)
 
-                course_dir = output_dir / course["safe_name"]
-                sections = get_top_level_sections(session, base_url, course["id"])
+            def collect_course_worker(course):
+                slot_id = worker_slots.get()
+                display_name = course["name"]
+                if len(display_name) > 35:
+                    display_name = display_name[:32] + "..."
 
-                found_for_course = 0
-                if sections:
-                    for section in sections:
-                        section_dir = course_dir / section["name"]
-                        files = collect_files_recursive(
-                            session, base_url, course["id"], section["id"], extensions
-                        )
-                        for f in files:
-                            dest = section_dir / _safe(f["filename"])
-                            download_tasks.append(
-                                {
-                                    "url": f["url"],
-                                    "dest": dest,
-                                    "course": course["name"],
-                                    "section": section["name"],
-                                }
+                collection_progress.update(
+                    slot_id,
+                    description=f"[cyan]{display_name}",
+                    visible=True,
+                )
+
+                course_start = time.time()
+                call_counter = [0]
+                tasks_found = []
+
+                try:
+                    course_dir = output_dir / course["safe_name"]
+                    call_counter[0] += 1
+                    sections = get_top_level_sections(session, base_url, course["id"])
+
+                    if sections:
+                        for section in sections:
+                            section_dir = course_dir / section["name"]
+                            files = collect_files_recursive(
+                                session,
+                                base_url,
+                                course["id"],
+                                section["id"],
+                                extensions,
+                                call_counter=call_counter,
                             )
-                            found_for_course += 1
+                            for f in files:
+                                dest = section_dir / _safe(f["filename"])
+                                tasks_found.append(
+                                    {
+                                        "url": f["url"],
+                                        "dest": dest,
+                                        "course": course["name"],
+                                        "section": section["name"],
+                                    }
+                                )
 
-                course_time = time.time() - course_start_time
-                course_calls = session.api_calls - start_calls
-                avg_load = (course_time / course_calls) if course_calls > 0 else 0
+                    duration = time.time() - course_start
+                    calls = call_counter[0]
+                    avg_load = (duration / calls) if calls > 0 else 0
 
-                # Print stats cleanly above the progress bar
-                row = f"{course['name']:<{max_name_len}} | {found_for_course:>16} | {course_calls:>13} | {course_time:>7.1f}s | {avg_load:>8.2f}s"
-                collection_progress.console.print(row, highlight=False)
+                    stat = {
+                        "name": course["name"],
+                        "files": len(tasks_found),
+                        "calls": calls,
+                        "time": duration,
+                        "avg_load": avg_load,
+                    }
 
-                collection_progress.advance(task_id)
+                    return tasks_found, stat
+
+                finally:
+                    collection_progress.update(slot_id, visible=False)
+                    worker_slots.put(slot_id)
+                    collection_progress.advance(master_task)
+
+                    # Update master description with accurate completion counts
+                    completed = collection_progress.tasks[master_task].completed
+                    total = collection_progress.tasks[master_task].total
+                    collection_progress.update(
+                        master_task,
+                        description=f"[bold green]Overall Collection ({int(completed)}/{int(total)} courses)",
+                    )
+
+            with ThreadPoolExecutor(max_workers=num_scanners) as executor:
+                futures = {
+                    executor.submit(collect_course_worker, c): c for c in courses
+                }
+                for future in as_completed(futures):
+                    tasks, stat = future.result()
+                    download_tasks.extend(tasks)
+                    course_stats.append(stat)
 
     except KeyboardInterrupt:
         print("\nCollection interrupted. Proceeding with what was found.")
 
     total_collection_time = time.time() - total_collection_start
+
+    # Print summary table after collection completes
+    if course_stats:
+        max_name_len = max((len(s["name"]) for s in course_stats), default=11)
+        header = f"{'Course Name':<{max_name_len}} | {'Files Discovered':>16} | {'Links Visited':>13} | {'Time':>8} | {'Avg Load':>9}"
+        print()
+        console.print(header, style="bold", highlight=False)
+        console.print("-" * len(header), highlight=False)
+        for s in course_stats:
+            row = f"{s['name']:<{max_name_len}} | {s['files']:>16} | {s['calls']:>13} | {s['time']:>7.1f}s | {s['avg_load']:>8.2f}s"
+            console.print(row, highlight=False)
 
     # ── Phase 2: Confirmation & Verification ──────────────────────────────────
 
@@ -533,16 +603,9 @@ def main():
         print("\nNo files matching the extensions were found.")
         return
 
-    print("\n\n=== Download Summary ===")
-    for course_name, sections in summary.items():
-        print(f"\n[{course_name}]")
-        for section_name, counts in sections.items():
-            new_count = counts["new"]
-            ext_count = counts["existing"]
-            if new_count > 0 or ext_count > 0:
-                print(f"  - {section_name}: {new_count} new, {ext_count} existing")
-
-    print(f"\nTotal: {len(new_files)} new files, {len(existing_files)} existing files.")
+    print(
+        f"\nTotal: {len(new_files)} files not already downloaded, {len(existing_files)} files downloaded previously."
+    )
 
     print("\nOptions:")
     print("  [1] Download ONLY new files")
@@ -579,7 +642,6 @@ def main():
     success_count = 0
     failure_count = 0
 
-    # UI setup for Pattern 1 (Fixed slots)
     dl_progress = Progress(
         TextColumn("[bold blue]{task.description}", justify="right"),
         BarColumn(bar_width=None),
@@ -595,20 +657,16 @@ def main():
 
     try:
         with dl_progress:
-            # 1. Master task for overall progress
             master_task = dl_progress.add_task(
                 "[bold green]Overall Progress", total=len(tasks_to_run)
             )
 
-            # 2. Worker tasks (fixed slots). We use a thread-safe Queue to distribute these UI slots.
             worker_slots = Queue()
-            for i in range(args.concurrent_downloads):
-                # Hidden until a thread picks it up
+            for _ in range(args.concurrent_downloads):
                 task_id = dl_progress.add_task("", visible=False)
                 worker_slots.put(task_id)
 
             def download_worker(task):
-                """Wrapper function run by the thread pool that handles the UI slot assignment."""
                 dest_path = task["dest"]
                 url = task["url"]
 
@@ -616,10 +674,7 @@ def main():
                     dl_progress.advance(master_task)
                     return False
 
-                # Claim a UI slot
                 slot_id = worker_slots.get()
-
-                # Format name for display
                 display_name = dest_path.name
                 if len(display_name) > 30:
                     display_name = display_name[:27] + "..."
@@ -636,7 +691,6 @@ def main():
                 try:
                     resp = session.get(url, stream=True, allow_redirects=True)
                     if resp.status_code == 200:
-                        # Handle content disposition for real filename
                         cd = resp.headers.get("Content-Disposition", "")
                         if cd and "filename=" in cd:
                             m = re.search(
@@ -648,8 +702,6 @@ def main():
                                     dest_path = dest_path.parent / _safe(real_name)
 
                         dest_path.parent.mkdir(parents=True, exist_ok=True)
-
-                        # Get total size for progress bar tracking
                         total_size = int(resp.headers.get("Content-Length", 0)) or None
                         dl_progress.update(slot_id, total=total_size)
 
@@ -672,14 +724,12 @@ def main():
                     )
 
                 finally:
-                    # Release the slot and update master progress
                     dl_progress.update(slot_id, visible=False)
                     worker_slots.put(slot_id)
                     dl_progress.advance(master_task)
 
                 return success
 
-            # Run downloads concurrently
             with ThreadPoolExecutor(max_workers=args.concurrent_downloads) as executor:
                 futures = {executor.submit(download_worker, t): t for t in tasks_to_run}
                 for future in as_completed(futures):
