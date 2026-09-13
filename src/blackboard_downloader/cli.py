@@ -21,16 +21,19 @@ from urllib.parse import unquote, urljoin, urlparse
 import requests
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
-from rich.console import Console
+from rich.console import Console, Group
+from rich.live import Live
 from rich.progress import (
     BarColumn,
     DownloadColumn,
+    MofNCompleteColumn,
     Progress,
     SpinnerColumn,
     TextColumn,
     TimeRemainingColumn,
     TransferSpeedColumn,
 )
+from rich.table import Column
 
 CONTAINER_HANDLERS = {
     "resource/x-bb-folder",
@@ -469,32 +472,44 @@ def main():
 
     course_stats = []
 
-    # UI setup: simplified view for dynamic crawling length
+    # Overall Progress
+    overall_progress = Progress(
+        TextColumn("[bold green]{task.description}"),
+        BarColumn(bar_width=None),
+        TextColumn("[progress.percentage]{task.percentage:>3.0f}%", justify="left"),
+        TextColumn(
+            "({task.completed}/{task.total} courses)",
+            justify="right",
+            table_column=Column(width=15),
+        ),
+    )
+
+    # Worker Progress
     collection_progress = Progress(
         SpinnerColumn(),
         TextColumn("[bold blue]{task.description}"),
         BarColumn(bar_width=None),
-        console=console,
     )
 
+    # Group them together under a single live context
+    progress_group = Group(overall_progress, collection_progress)
+
     try:
-        with collection_progress:
-            master_task = collection_progress.add_task(
-                f"[bold green]Overall Collection (0/{len(courses)} courses)",
-                total=len(courses),
+        with Live(progress_group):
+            master_task = overall_progress.add_task(
+                "Overall Collection", total=len(courses)
             )
 
             worker_slots = Queue()
             for _ in range(num_scanners):
-                # Worker tasks get total=None to naturally render a pulsing bar
                 task_id = collection_progress.add_task("", visible=False)
                 worker_slots.put(task_id)
 
             def collect_course_worker(course):
                 slot_id = worker_slots.get()
                 display_name = course["name"]
-                if len(display_name) > 35:
-                    display_name = display_name[:32] + "..."
+                if len(display_name) > 64:
+                    display_name = display_name[:59] + "..."
 
                 collection_progress.update(
                     slot_id,
@@ -550,15 +565,7 @@ def main():
                 finally:
                     collection_progress.update(slot_id, visible=False)
                     worker_slots.put(slot_id)
-                    collection_progress.advance(master_task)
-
-                    # Update master description with accurate completion counts
-                    completed = int(collection_progress.tasks[master_task].completed)
-                    total = int(collection_progress.tasks[master_task].total or 0)
-                    collection_progress.update(
-                        master_task,
-                        description=f"[bold green]Overall Collection ({completed}/{total} courses)",
-                    )
+                    overall_progress.advance(master_task)
 
             with ThreadPoolExecutor(max_workers=num_scanners) as executor:
                 futures = {
@@ -642,23 +649,41 @@ def main():
     success_count = 0
     failure_count = 0
 
-    dl_progress = Progress(
-        TextColumn("[bold blue]{task.description}", justify="right"),
+    # Overall Progress (Tracks total files)
+    overall_progress = Progress(
+        TextColumn(
+            "[bold green]{task.description}",
+            justify="right",
+            table_column=Column(width=30),
+        ),
         BarColumn(bar_width=None),
-        "[progress.percentage]{task.percentage:>3.1f}%",
-        "•",
-        DownloadColumn(),
-        "•",
-        TransferSpeedColumn(),
-        "•",
-        TimeRemainingColumn(),
-        console=console,
+        TextColumn("[progress.percentage]{task.percentage:>3.1f}%"),
+        MofNCompleteColumn(table_column=Column(width=11, justify="right")),
+        TextColumn("[dim]Files", justify="left"),
+        TimeRemainingColumn(table_column=Column(width=8, justify="right")),
     )
 
+    # Worker Progress (Tracks bytes per file)
+    dl_progress = Progress(
+        TextColumn(
+            "[bold blue]{task.description}",
+            justify="right",
+            table_column=Column(width=30),
+        ),
+        BarColumn(bar_width=None),
+        TextColumn("[progress.percentage]{task.percentage:>3.1f}%"),
+        DownloadColumn(table_column=Column(width=19, justify="right")),
+        TransferSpeedColumn(table_column=Column(width=12, justify="right")),
+        TimeRemainingColumn(table_column=Column(width=8, justify="right")),
+    )
+
+    # Group them together under a single live context
+    progress_group = Group(overall_progress, dl_progress)
+
     try:
-        with dl_progress:
-            master_task = dl_progress.add_task(
-                "[bold green]Overall Progress", total=len(tasks_to_run)
+        with Live(progress_group, console=console):
+            master_task = overall_progress.add_task(
+                "Overall Progress", total=len(tasks_to_run)
             )
 
             worker_slots = Queue()
@@ -671,13 +696,13 @@ def main():
                 url = task["url"]
 
                 if dest_path.exists() and not overwrite:
-                    dl_progress.advance(master_task)
+                    overall_progress.advance(master_task)
                     return False
 
                 slot_id = worker_slots.get()
                 display_name = dest_path.name
-                if len(display_name) > 30:
-                    display_name = display_name[:27] + "..."
+                if len(display_name) > 27:
+                    display_name = display_name[:24] + "..."
 
                 dl_progress.update(
                     slot_id,
@@ -712,13 +737,13 @@ def main():
                                     dl_progress.advance(slot_id, len(chunk))
                         success = True
                     else:
-                        dl_progress.console.print(
+                        console.print(
                             f"[red]Failed ({resp.status_code}): {display_name}[/red]",
                             highlight=False,
                         )
 
                 except (requests.RequestException, OSError) as e:
-                    dl_progress.console.print(
+                    console.print(
                         f"[red]Error downloading {display_name}: {e}[/red]",
                         highlight=False,
                     )
@@ -726,7 +751,7 @@ def main():
                 finally:
                     dl_progress.update(slot_id, visible=False)
                     worker_slots.put(slot_id)
-                    dl_progress.advance(master_task)
+                    overall_progress.advance(master_task)
 
                 return success
 
@@ -747,14 +772,12 @@ def main():
     # ── Final Report ──────────────────────────────────────────────────────────
 
     print("\n=== Final Run Statistics ===")
-    print(
-        f"Collection Time: {total_collection_time:.1f}s (Total API requests: {session.api_calls})"
-    )
-    print(f"Download Time:   {download_time:.1f}s")
-    print(f"Avg DL Time/File:{avg_dl_time:.2f}s")
-    print(f"Successfully DL: {success_count}")
+    print(f"Collection Time:      {total_collection_time:.1f}s")
+    print(f"Download Time:        {download_time:.1f}s")
+    print(f"Avg DL Time/File:     {avg_dl_time:.2f}s")
+    print(f"Successful Downloads: {success_count}")
     if failure_count > 0:
-        print(f"Failed/Skipped:  {failure_count}")
+        print(f"Failed/Skipped:       {failure_count}")
 
 
 if __name__ == "__main__":
