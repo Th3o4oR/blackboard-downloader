@@ -7,6 +7,8 @@ Usage: python3 bb_downloader.py
 import argparse
 import json
 import re
+import time
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from urllib.parse import unquote, urljoin, urlparse
@@ -26,7 +28,22 @@ CONTAINER_HANDLERS = {
 DEFAULT_EXTENSIONS = {".pdf"}
 
 
-# ── Auth ──────────────────────────────────────────────────────────────────────
+# ── Auth & Networking ─────────────────────────────────────────────────────────
+
+
+class TrackedSession:
+    """Wraps requests.Session to track the number of API calls made."""
+
+    def __init__(self, session):
+        self.session = session
+        self.api_calls = 0
+
+    def get(self, *args, **kwargs):
+        self.api_calls += 1
+        return self.session.get(*args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self.session, name)
 
 
 def wait_for_login(page, base_url):
@@ -47,7 +64,7 @@ def get_session_from_browser(context):
             "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
         }
     )
-    return session
+    return TrackedSession(session)
 
 
 # ── User & courses ────────────────────────────────────────────────────────────
@@ -276,11 +293,11 @@ def _matches(filename, mime, extensions):
 # ── Download ──────────────────────────────────────────────────────────────────
 
 
-def download_file(session, url, dest_path: Path):
+def download_file(session, url, dest_path: Path, overwrite=False):
     """
     Downloads a file. Returns True if downloaded, False if skipped/failed.
     """
-    if dest_path.exists():
+    if dest_path.exists() and not overwrite:
         return False
 
     resp = session.get(url, stream=True, allow_redirects=True)
@@ -418,45 +435,129 @@ def main():
 
     courses = pick_term(term_map)
 
-    print(f"\nGathering file links for {len(courses)} course(s)...")
+    # ── Phase 1: Collect Links ────────────────────────────────────────────────
+
+    print(f"\nGathering file links for {len(courses)} course(s)...\n")
     download_tasks = []
+    total_collection_start = time.time()
 
     try:
-        # Phase 1: Collect
-        for course in courses:
-            print(f"[{course['name']}]")
+        for course in tqdm(courses, desc="Collecting Courses", unit="course"):
+            course_start_time = time.time()
+            start_calls = session.api_calls
+
             course_dir = output_dir / course["safe_name"]
-
             sections = get_top_level_sections(session, base_url, course["id"])
-            if not sections:
-                continue
 
-            for section in sections:
-                section_dir = course_dir / section["name"]
-                files = collect_files_recursive(
-                    session, base_url, course["id"], section["id"], extensions
-                )
-                for f in files:
-                    dest = section_dir / _safe(f["filename"])
-                    download_tasks.append((f["url"], dest))
+            found_for_course = 0
+            if sections:
+                for section in sections:
+                    section_dir = course_dir / section["name"]
+                    files = collect_files_recursive(
+                        session, base_url, course["id"], section["id"], extensions
+                    )
+                    for f in files:
+                        dest = section_dir / _safe(f["filename"])
+                        download_tasks.append(
+                            {
+                                "url": f["url"],
+                                "dest": dest,
+                                "course": course["name"],
+                                "section": section["name"],
+                            }
+                        )
+                        found_for_course += 1
 
-        # Phase 2: Download
-        total_downloaded = 0
-        if not download_tasks:
-            print("\nNo files matching the extensions were found.")
+            course_time = time.time() - course_start_time
+            course_calls = session.api_calls - start_calls
+            avg_load = (course_time / course_calls) if course_calls > 0 else 0
+
+            # Print stats directly above the progress bar
+            tqdm.write(
+                f"  -> [{course['name']}] Found {found_for_course} files. "
+                f"Visited {course_calls} links in {course_time:.1f}s "
+                f"(Avg load: {avg_load:.2f}s/link)"
+            )
+
+    except KeyboardInterrupt:
+        print("\nCollection interrupted. Proceeding with what was found.")
+
+    total_collection_time = time.time() - total_collection_start
+
+    # ── Phase 2: Confirmation & Verification ──────────────────────────────────
+
+    new_files = []
+    existing_files = []
+    # summary structure: dict[course][section] = {"new": 0, "existing": 0}
+    summary = defaultdict(lambda: defaultdict(lambda: {"new": 0, "existing": 0}))
+
+    for task in download_tasks:
+        if task["dest"].exists():
+            existing_files.append(task)
+            summary[task["course"]][task["section"]]["existing"] += 1
+        else:
+            new_files.append(task)
+            summary[task["course"]][task["section"]]["new"] += 1
+
+    if not download_tasks:
+        print("\nNo files matching the extensions were found.")
+        return
+
+    print("\n\n=== Download Summary ===")
+    for course_name, sections in summary.items():
+        print(f"\n[{course_name}]")
+        for section_name, counts in sections.items():
+            new_count = counts["new"]
+            ext_count = counts["existing"]
+            if new_count > 0 or ext_count > 0:
+                print(f"  - {section_name}: {new_count} new, {ext_count} existing")
+
+    print(f"\nTotal: {len(new_files)} new files, {len(existing_files)} existing files.")
+
+    print("\nOptions:")
+    print("  [1] Download ONLY new files")
+    print("  [2] Download new AND overwrite existing files")
+    print("  [3] Cancel")
+
+    tasks_to_run = []
+    overwrite = False
+
+    while True:
+        choice = input("\nSelect an option: ").strip()
+        if choice == "1":
+            tasks_to_run = new_files
+            break
+        elif choice == "2":
+            tasks_to_run = new_files + existing_files
+            overwrite = True
+            break
+        elif choice == "3":
+            print("Cancelled.")
             return
+        print("Invalid choice, try again.")
 
-        print(
-            f"\nStarting {len(download_tasks)} download(s) using {args.concurrent_downloads} workers..."
-        )
+    if not tasks_to_run:
+        print("No files to download. Exiting.")
+        return
+
+    # ── Phase 3: Download ─────────────────────────────────────────────────────
+
+    print(
+        f"\nStarting {len(tasks_to_run)} download(s) using {args.concurrent_downloads} workers..."
+    )
+    download_start = time.time()
+    success_count = 0
+    failure_count = 0
+
+    try:
         with ThreadPoolExecutor(max_workers=args.concurrent_downloads) as executor:
-            # Map futures to destinations for error handling if needed
             futures = {
-                executor.submit(download_file, session, url, dest): dest
-                for url, dest in download_tasks
+                executor.submit(
+                    download_file, session, task["url"], task["dest"], overwrite
+                ): task
+                for task in tasks_to_run
             }
 
-            # Progress bar wrapping the completed futures
             for future in tqdm(
                 as_completed(futures),
                 total=len(futures),
@@ -464,12 +565,27 @@ def main():
                 unit="file",
             ):
                 if future.result():
-                    total_downloaded += 1
-
-        print(f"\nDone! Downloaded {total_downloaded} new file(s) to {output_dir}")
+                    success_count += 1
+                else:
+                    failure_count += 1
 
     except KeyboardInterrupt:
-        print("\nInterrupted.")
+        print("\nDownloads interrupted.")
+
+    download_time = time.time() - download_start
+    avg_dl_time = (download_time / len(tasks_to_run)) if tasks_to_run else 0
+
+    # ── Final Report ──────────────────────────────────────────────────────────
+
+    print("\n=== Final Run Statistics ===")
+    print(
+        f"Collection Time: {total_collection_time:.1f}s (Total API requests: {session.api_calls})"
+    )
+    print(f"Download Time:   {download_time:.1f}s")
+    print(f"Avg DL Time/File:{avg_dl_time:.2f}s")
+    print(f"Successfully DL: {success_count}")
+    if failure_count > 0:
+        print(f"Failed/Skipped:  {failure_count}")
 
 
 if __name__ == "__main__":
