@@ -231,7 +231,7 @@ def _extract_from_body(body, base_url, extensions):
 
     for a in soup.find_all("a"):
         bbfile = a.get("data-bbfile")
-        if bbfile:
+        if isinstance(bbfile, str):
             try:
                 info = json.loads(bbfile)
                 filename = info.get("displayName") or info.get("linkName", "")
@@ -243,9 +243,10 @@ def _extract_from_body(body, base_url, extensions):
                 pass
             continue
 
-        href = a.get("href", "")
-        if not href:
+        href = a.get("href")
+        if not isinstance(href, str) or not href:
             continue
+
         filename = unquote(urlparse(href).path.split("/")[-1])
         if _matches(filename, "", extensions):
             files.append({"url": urljoin(base_url, href), "filename": filename})
