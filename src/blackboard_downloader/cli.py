@@ -717,7 +717,7 @@ def main():
                             highlight=False,
                         )
 
-                except Exception as e:
+                except (requests.RequestException, OSError) as e:
                     dl_progress.console.print(
                         f"[red]Error downloading {display_name}: {e}[/red]",
                         highlight=False,
