@@ -1,22 +1,21 @@
-#!/usr/bin/env python3
 """
 Blackboard Learn PDF Downloader
 Supports any school running Blackboard Learn.
 Usage: python3 bb_downloader.py
 """
 
-import re
-import json
 import argparse
+import json
+import re
 from pathlib import Path
-from urllib.parse import urljoin, urlparse, unquote
+from urllib.parse import unquote, urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
-from webdriver_manager.chrome import ChromeDriverManager
 from selenium.webdriver.chrome.service import Service
+from webdriver_manager.chrome import ChromeDriverManager
 
 CONTAINER_HANDLERS = {
     "resource/x-bb-folder",
@@ -30,6 +29,7 @@ DEFAULT_EXTENSIONS = {".pdf"}
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
 
+
 def wait_for_login(driver, base_url):
     driver.get(f"{base_url}/ultra/course")
     print("\nA browser window has opened.")
@@ -40,14 +40,19 @@ def wait_for_login(driver, base_url):
 def get_session_from_browser(driver):
     session = requests.Session()
     for cookie in driver.get_cookies():
-        session.cookies.set(cookie["name"], cookie["value"], domain=cookie.get("domain"))
-    session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
-    })
+        session.cookies.set(
+            cookie["name"], cookie["value"], domain=cookie.get("domain")
+        )
+    session.headers.update(
+        {
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
+        }
+    )
     return session
 
 
 # ── User & courses ────────────────────────────────────────────────────────────
+
 
 def get_my_user_id(session, base_url):
     resp = session.get(f"{base_url}/learn/api/public/v1/users/me")
@@ -95,17 +100,23 @@ def build_term_map(session, base_url, enrollments):
         if not detail:
             continue
 
-        course_code = detail.get("courseId", "")   # e.g. "26sprgcasma225_c1"
+        course_code = detail.get("courseId", "")  # e.g. "26sprgcasma225_c1"
         name = detail.get("name", "Unknown")
-        term_label = detail.get("term", {}).get("name") or _infer_term(course_code) or "Unknown Term"
+        term_label = (
+            detail.get("term", {}).get("name")
+            or _infer_term(course_code)
+            or "Unknown Term"
+        )
         safe_name = _safe(name)
 
-        term_map.setdefault(term_label, []).append({
-            "id": raw_id,
-            "name": name,
-            "safe_name": safe_name,
-            "course_code": course_code,
-        })
+        term_map.setdefault(term_label, []).append(
+            {
+                "id": raw_id,
+                "name": name,
+                "safe_name": safe_name,
+                "course_code": course_code,
+            }
+        )
 
     return term_map
 
@@ -117,8 +128,14 @@ def _infer_term(course_code):
         return None
     yy, sem = m.group(1), m.group(2).lower()
     year = f"20{yy}"
-    names = {"sprg": "Spring", "fall": "Fall", "sum": "Summer",
-             "sum1": "Summer 1", "sum2": "Summer 2", "sum3": "Summer 3"}
+    names = {
+        "sprg": "Spring",
+        "fall": "Fall",
+        "sum": "Summer",
+        "sum1": "Summer 1",
+        "sum2": "Summer 2",
+        "sum3": "Summer 3",
+    }
     return f"{names.get(sem, sem.title())} {year}"
 
 
@@ -141,7 +158,7 @@ def pick_term(term_map):
             return all_courses
         if raw.isdigit() and 1 <= int(raw) <= len(terms):
             selected = term_map[terms[int(raw) - 1]]
-            print(f"\nCourses in selected term:")
+            print("\nCourses in selected term:")
             for c in selected:
                 print(f"  - {c['name']}")
             return selected
@@ -150,16 +167,21 @@ def pick_term(term_map):
 
 # ── Content traversal ─────────────────────────────────────────────────────────
 
+
 def get_top_level_sections(session, base_url, course_id):
-    resp = session.get(f"{base_url}/learn/api/public/v1/courses/{course_id}/contents?limit=100")
+    resp = session.get(
+        f"{base_url}/learn/api/public/v1/courses/{course_id}/contents?limit=100"
+    )
     if resp.status_code != 200:
         return []
     sections = []
     for item in resp.json().get("results", []):
-        sections.append({
-            "id": item.get("id"),
-            "name": _safe(item.get("title", "Untitled")),
-        })
+        sections.append(
+            {
+                "id": item.get("id"),
+                "name": _safe(item.get("title", "Untitled")),
+            }
+        )
     return sections
 
 
@@ -172,13 +194,17 @@ def collect_files_recursive(session, base_url, course_id, item_id, extensions):
 
     def fetch(node_id):
         # Fetch node detail (contains body HTML)
-        detail_resp = session.get(f"{base_url}/learn/api/public/v1/courses/{course_id}/contents/{node_id}")
+        detail_resp = session.get(
+            f"{base_url}/learn/api/public/v1/courses/{course_id}/contents/{node_id}"
+        )
         if detail_resp.status_code == 200:
             body = detail_resp.json().get("body", "")
             files.extend(_extract_from_body(body, base_url, extensions))
 
         # Fetch traditional attachments
-        att_resp = session.get(f"{base_url}/learn/api/public/v1/courses/{course_id}/contents/{node_id}/attachments")
+        att_resp = session.get(
+            f"{base_url}/learn/api/public/v1/courses/{course_id}/contents/{node_id}/attachments"
+        )
         if att_resp.status_code == 200:
             for att in att_resp.json().get("results", []):
                 filename = att.get("fileName", "")
@@ -219,7 +245,7 @@ def _extract_from_body(body, base_url, extensions):
                 url = info.get("resourceUrl") or a.get("href", "")
                 if url and _matches(filename, mime, extensions):
                     files.append({"url": url, "filename": filename})
-            except (json.JSONDecodeError, AttributeError):
+            except json.JSONDecodeError, AttributeError:
                 pass
             continue
 
@@ -251,6 +277,7 @@ def _matches(filename, mime, extensions):
 
 # ── Download ──────────────────────────────────────────────────────────────────
 
+
 def download_file(session, url, dest_path: Path):
     if dest_path.exists():
         print(f"    skip (exists): {dest_path.name}")
@@ -272,13 +299,13 @@ def download_file(session, url, dest_path: Path):
 
     dest_path.parent.mkdir(parents=True, exist_ok=True)
     with open(dest_path, "wb") as f:
-        for chunk in resp.iter_content(chunk_size=8192):
-            f.write(chunk)
+        f.writelines(resp.iter_content(chunk_size=8192))
     print(f"    downloaded: {dest_path.name}")
     return True
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
+
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -288,23 +315,24 @@ def parse_args():
 Examples:
   python3 bb_downloader.py
   python3 bb_downloader.py --url learn.bu.edu --output ~/Desktop/BB --ext .pdf .pptx
-        """
+        """,
     )
     parser.add_argument(
         "--url",
         default=None,
-        help="Blackboard domain, e.g. learn.bu.edu (prompted if not provided)"
+        help="Blackboard domain, e.g. learn.bu.edu (prompted if not provided)",
     )
     parser.add_argument(
-        "--output", "-o",
+        "--output",
+        "-o",
         default=str(Path.home() / "Downloads" / "Blackboard"),
-        help="Download destination folder (default: ~/Downloads/Blackboard)"
+        help="Download destination folder (default: ~/Downloads/Blackboard)",
     )
     parser.add_argument(
         "--ext",
         nargs="+",
         default=None,
-        help="File extensions to download, e.g. --ext .pdf .pptx .docx (prompted if not provided)"
+        help="File extensions to download, e.g. --ext .pdf .pptx .docx (prompted if not provided)",
     )
     return parser.parse_args()
 
@@ -352,7 +380,9 @@ def main():
 
     # Launch browser for login
     options = Options()
-    driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
+    driver = webdriver.Chrome(
+        service=Service(ChromeDriverManager().install()), options=options
+    )
 
     try:
         wait_for_login(driver, base_url)
@@ -393,7 +423,9 @@ def main():
             for section in sections:
                 print(f"  /{section['name']}")
                 section_dir = course_dir / section["name"]
-                files = collect_files_recursive(session, base_url, course["id"], section["id"], extensions)
+                files = collect_files_recursive(
+                    session, base_url, course["id"], section["id"], extensions
+                )
                 for f in files:
                     dest = section_dir / _safe(f["filename"])
                     if download_file(session, f["url"], dest):
