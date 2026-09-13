@@ -415,6 +415,38 @@ def main():
 
     courses = pick_term(term_map)
 
+    # Filter courses
+    print(f"\nSelected term contains {len(courses)} course(s).")
+    raw_query = (
+        input(
+            "Enter search terms (comma or space separated) to filter by name/code (leave empty for all): "
+        )
+        .strip()
+        .lower()
+    )
+
+    if raw_query:
+        # Replace commas with spaces, then split by whitespace to get individual terms
+        query_terms = raw_query.replace(",", " ").split()
+
+        filtered_courses = []
+        for c in courses:
+            c_name = c["name"].lower()
+            c_code = c["course_code"].lower()
+
+            # If ANY of the query terms match the course name or code, include it
+            if any(term in c_name or term in c_code for term in query_terms):
+                filtered_courses.append(c)
+
+        if not filtered_courses:
+            print("No courses matched your filter. Exiting.")
+            return
+
+        courses = filtered_courses
+        print(f"\nFiltered down to {len(courses)} course(s):")
+        for c in courses:
+            print(f"  - {c['name']}")
+
     # ── Phase 1: Collect Links ────────────────────────────────────────────────
 
     print(f"\nGathering file links for {len(courses)} course(s)...\n")
@@ -425,8 +457,8 @@ def main():
 
     # Print table header
     header = f"{'Course Name':<{max_name_len}} | {'Files Discovered':>16} | {'Links Visited':>13} | {'Time':>8} | {'Avg Load':>9}"
-    console.print(header, style="bold")
-    console.print("-" * len(header))
+    console.print(header, style="bold", highlight=False)
+    console.print("-" * len(header), highlight=False)
 
     # Phase 1 Rich Progress
     collection_progress = Progress(
@@ -474,7 +506,7 @@ def main():
 
                 # Print stats cleanly above the progress bar
                 row = f"{course['name']:<{max_name_len}} | {found_for_course:>16} | {course_calls:>13} | {course_time:>7.1f}s | {avg_load:>8.2f}s"
-                collection_progress.console.print(row)
+                collection_progress.console.print(row, highlight=False)
 
                 collection_progress.advance(task_id)
 
@@ -629,12 +661,14 @@ def main():
                         success = True
                     else:
                         dl_progress.console.print(
-                            f"[red]Failed ({resp.status_code}): {display_name}[/red]"
+                            f"[red]Failed ({resp.status_code}): {display_name}[/red]",
+                            highlight=False,
                         )
 
                 except Exception as e:
                     dl_progress.console.print(
-                        f"[red]Error downloading {display_name}: {e}[/red]"
+                        f"[red]Error downloading {display_name}: {e}[/red]",
+                        highlight=False,
                     )
 
                 finally:
