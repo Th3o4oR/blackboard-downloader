@@ -441,7 +441,7 @@ def main():
     max_name_len = max((len(c["name"]) for c in courses), default=11)
 
     # Print table header
-    header = f"{'Course Name':<{max_name_len}} | {'Files':>5} | {'Links':>6} | {'Time':>8} | {'Avg Load':>9}"
+    header = f"{'Course Name':<{max_name_len}} | {'Files Discovered':>16} | {'Links Visited':>13} | {'Time':>8} | {'Avg Load':>9}"
     print(header)
     print("-" * len(header))
 
@@ -477,7 +477,7 @@ def main():
             avg_load = (course_time / course_calls) if course_calls > 0 else 0
 
             # Print stats directly above the progress bar as a table row
-            row = f"{course['name']:<{max_name_len}} | {found_for_course:>5} | {course_calls:>6} | {course_time:>7.1f}s | {avg_load:>8.2f}s"
+            row = f"{course['name']:<{max_name_len}} | {found_for_course:>16} | {course_calls:>13} | {course_time:>7.1f}s | {avg_load:>8.2f}s"
             tqdm.write(row)
 
     except KeyboardInterrupt:
