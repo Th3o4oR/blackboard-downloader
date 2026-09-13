@@ -348,7 +348,19 @@ Examples:
     parser.add_argument(
         "--ext",
         nargs="+",
-        default=".pdf .pptx .docx .zip .py .ipynb .cpp .h .c .m .tex",
+        default=[
+            ".pdf",
+            ".pptx",
+            ".docx",
+            ".zip",
+            ".py",
+            ".ipynb",
+            ".cpp",
+            ".h",
+            ".c",
+            ".m",
+            ".tex",
+        ],
         help=(
             "File extensions to download, e.g. --ext .pdf .pptx .docx"
             "(default: .pdf .pptx .docx .zip .py .ipynb .cpp .h .c. .tex)"
@@ -371,21 +383,6 @@ def prompt_url():
     return raw
 
 
-def prompt_extensions():
-    print("\nFile types to download (space-separated, e.g: .pdf .pptx .docx)")
-    print("Press Enter for PDF only:")
-    raw = input("  > ").strip()
-    if not raw:
-        return DEFAULT_EXTENSIONS
-    exts = set()
-    for e in raw.split():
-        e = e.lower()
-        if not e.startswith("."):
-            e = f".{e}"
-        exts.add(e)
-    return exts
-
-
 def main():
     args = parse_args()
 
@@ -397,7 +394,7 @@ def main():
     else:
         base_url = prompt_url()
 
-    extensions = set(args.ext) if args.ext else prompt_extensions()
+    extensions = set(args.ext)
     print(f"\nFile types: {', '.join(sorted(extensions))}")
 
     output_dir = Path(args.output)
