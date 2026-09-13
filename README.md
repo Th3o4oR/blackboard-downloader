@@ -14,18 +14,18 @@ Automatically download course files from any **Blackboard Learn** instance. Supp
 ## Requirements
 
 - Python 3.8+
-- Google Chrome installed
+- `uv`
 
 ## Installation
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/blackboard-downloader.git
+git clone https://github.com/Th3o4oR/blackboard-downloader.git
 cd blackboard-downloader
 
-python3 -m venv venv
-source venv/bin/activate        # Windows: venv\Scripts\activate
+uv sync
+source .venv/bin/activate        # Windows: venv\Scripts\activate
 
-pip install -r requirements.txt
+playwright install chromium
 ```
 
 ## Usage
@@ -33,7 +33,7 @@ pip install -r requirements.txt
 ### Interactive mode (recommended)
 
 ```bash
-python3 bb_downloader.py
+uv run blackboard-downloader
 ```
 
 The script will ask for:
