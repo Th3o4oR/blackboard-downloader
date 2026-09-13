@@ -438,6 +438,13 @@ def main():
     download_tasks = []
     total_collection_start = time.time()
 
+    max_name_len = max((len(c["name"]) for c in courses), default=11)
+
+    # Print table header
+    header = f"{'Course Name':<{max_name_len}} | {'Files':>5} | {'Links':>6} | {'Time':>8} | {'Avg Load':>9}"
+    print(header)
+    print("-" * len(header))
+
     try:
         for course in tqdm(courses, desc="Collecting Courses", unit="course"):
             course_start_time = time.time()
@@ -469,12 +476,9 @@ def main():
             course_calls = session.api_calls - start_calls
             avg_load = (course_time / course_calls) if course_calls > 0 else 0
 
-            # Print stats directly above the progress bar
-            tqdm.write(
-                f"  -> [{course['name']}] Found {found_for_course} files. "
-                f"Visited {course_calls} links in {course_time:.1f}s "
-                f"(Avg load: {avg_load:.2f}s/link)"
-            )
+            # Print stats directly above the progress bar as a table row
+            row = f"{course['name']:<{max_name_len}} | {found_for_course:>5} | {course_calls:>6} | {course_time:>7.1f}s | {avg_load:>8.2f}s"
+            tqdm.write(row)
 
     except KeyboardInterrupt:
         print("\nCollection interrupted. Proceeding with what was found.")
