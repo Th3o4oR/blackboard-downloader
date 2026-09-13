@@ -363,7 +363,7 @@ Examples:
         ],
         help=(
             "File extensions to download, e.g. --ext .pdf .pptx .docx"
-            "(default: .pdf .pptx .docx .zip .py .ipynb .cpp .h .c. .tex)"
+            "(default: .pdf .pptx .docx .zip .py .ipynb .cpp .h .c .m .tex)"
         ),
     )
     parser.add_argument(

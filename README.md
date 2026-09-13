@@ -38,8 +38,7 @@ uv run blackboard-downloader
 
 The script will ask for:
 1. Your Blackboard domain (e.g. `learn.bu.edu`)
-2. File types to download (default: `.pdf`)
-3. Which term to download
+2. Which term to download
 
 ### Command-line flags
 
@@ -54,7 +53,7 @@ python3 bb_downloader.py \
 |------|-------------|---------|
 | `--url` | Blackboard domain | prompted |
 | `--output` | Download folder | `~/Downloads/Blackboard` |
-| `--ext` | File extensions | prompted (default `.pdf`) |
+| `--ext` | File extensions | `.pdf .pptx .docx .zip .py .ipynb .cpp .h .c .m .tex` |
 
 ### Output structure
 
