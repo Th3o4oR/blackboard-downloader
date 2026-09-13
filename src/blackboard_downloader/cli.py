@@ -331,8 +331,11 @@ Examples:
     parser.add_argument(
         "--ext",
         nargs="+",
-        default=None,
-        help="File extensions to download, e.g. --ext .pdf .pptx .docx (prompted if not provided)",
+        default=".pdf .pptx .docx .zip .py .ipynb .cpp .h .c .m .tex",
+        help=(
+            "File extensions to download, e.g. --ext .pdf .pptx .docx"
+            "(default: .pdf .pptx .docx .zip .py .ipynb .cpp .h .c. .tex)"
+        ),
     )
     parser.add_argument(
         "--concurrent-downloads",
