@@ -54,7 +54,9 @@ python3 bb_downloader.py \
 | `--url` | Blackboard domain | prompted |
 | `--output` | Download folder | `~/Downloads/Blackboard` |
 | `--ext` | File extensions | `.pdf .pptx .docx .zip .py .ipynb .cpp .h .c .m .tex` |
-
+| `--concurrent-collection` | Number of concurrent workers for file discovery | `5` |
+| `--concurrent-downloads` | Number of concurrent workers for downloads | `5` |
+-v
 ### Output structure
 
 ```
