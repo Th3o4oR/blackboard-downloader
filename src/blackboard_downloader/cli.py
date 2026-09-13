@@ -7,12 +7,14 @@ Usage: python3 bb_downloader.py
 import argparse
 import json
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from urllib.parse import unquote, urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
+from tqdm import tqdm
 
 CONTAINER_HANDLERS = {
     "resource/x-bb-folder",
@@ -239,7 +241,9 @@ def _extract_from_body(body, base_url, extensions):
                 url = info.get("resourceUrl") or a.get("href", "")
                 if url and _matches(filename, mime, extensions):
                     files.append({"url": url, "filename": filename})
-            except json.JSONDecodeError, AttributeError:
+            except json.JSONDecodeError:
+                pass
+            except AttributeError:
                 pass
             continue
 
@@ -273,13 +277,15 @@ def _matches(filename, mime, extensions):
 
 
 def download_file(session, url, dest_path: Path):
+    """
+    Downloads a file. Returns True if downloaded, False if skipped/failed.
+    """
     if dest_path.exists():
-        print(f"    skip (exists): {dest_path.name}")
         return False
 
     resp = session.get(url, stream=True, allow_redirects=True)
     if resp.status_code != 200:
-        print(f"    failed ({resp.status_code}): {dest_path.name}")
+        tqdm.write(f"Failed ({resp.status_code}): {dest_path.name}")
         return False
 
     cd = resp.headers.get("Content-Disposition", "")
@@ -292,8 +298,9 @@ def download_file(session, url, dest_path: Path):
 
     dest_path.parent.mkdir(parents=True, exist_ok=True)
     with open(dest_path, "wb") as f:
-        f.writelines(resp.iter_content(chunk_size=8192))
-    print(f"    downloaded: {dest_path.name}")
+        for chunk in resp.iter_content(chunk_size=8192):
+            if chunk:
+                f.write(chunk)
     return True
 
 
@@ -326,6 +333,12 @@ Examples:
         nargs="+",
         default=None,
         help="File extensions to download, e.g. --ext .pdf .pptx .docx (prompted if not provided)",
+    )
+    parser.add_argument(
+        "--concurrent-downloads",
+        type=int,
+        default=5,
+        help="Maximum number of concurrent downloads (default: 5)",
     )
     return parser.parse_args()
 
@@ -373,8 +386,6 @@ def main():
 
     # Launch Playwright browser context
     with sync_playwright() as p:
-        # Default: uses Playwright's bundled Chromium
-        # To use Arc instead, add: executable_path="/Applications/Arc.app/Contents/MacOS/Arc"
         browser = p.chromium.launch(headless=False)
         context = browser.new_context()
         page = context.new_page()
@@ -404,31 +415,55 @@ def main():
 
     courses = pick_term(term_map)
 
-    print(f"\nStarting download for {len(courses)} course(s)...\n")
-    total = 0
+    print(f"\nGathering file links for {len(courses)} course(s)...")
+    download_tasks = []
 
     try:
+        # Phase 1: Collect
         for course in courses:
             print(f"[{course['name']}]")
             course_dir = output_dir / course["safe_name"]
 
             sections = get_top_level_sections(session, base_url, course["id"])
             if not sections:
-                print("  No accessible content.")
                 continue
 
             for section in sections:
-                print(f"  /{section['name']}")
                 section_dir = course_dir / section["name"]
                 files = collect_files_recursive(
                     session, base_url, course["id"], section["id"], extensions
                 )
                 for f in files:
                     dest = section_dir / _safe(f["filename"])
-                    if download_file(session, f["url"], dest):
-                        total += 1
+                    download_tasks.append((f["url"], dest))
 
-        print(f"\nDone! Downloaded {total} file(s) to {output_dir}")
+        # Phase 2: Download
+        total_downloaded = 0
+        if not download_tasks:
+            print("\nNo files matching the extensions were found.")
+            return
+
+        print(
+            f"\nStarting {len(download_tasks)} download(s) using {args.concurrent_downloads} workers..."
+        )
+        with ThreadPoolExecutor(max_workers=args.concurrent_downloads) as executor:
+            # Map futures to destinations for error handling if needed
+            futures = {
+                executor.submit(download_file, session, url, dest): dest
+                for url, dest in download_tasks
+            }
+
+            # Progress bar wrapping the completed futures
+            for future in tqdm(
+                as_completed(futures),
+                total=len(futures),
+                desc="Downloading",
+                unit="file",
+            ):
+                if future.result():
+                    total_downloaded += 1
+
+        print(f"\nDone! Downloaded {total_downloaded} new file(s) to {output_dir}")
 
     except KeyboardInterrupt:
         print("\nInterrupted.")
