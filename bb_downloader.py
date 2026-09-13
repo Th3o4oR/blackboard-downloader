@@ -12,10 +12,7 @@ from urllib.parse import unquote, urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
-from webdriver_manager.chrome import ChromeDriverManager
+from playwright.sync_api import sync_playwright
 
 CONTAINER_HANDLERS = {
     "resource/x-bb-folder",
@@ -30,16 +27,16 @@ DEFAULT_EXTENSIONS = {".pdf"}
 # ── Auth ──────────────────────────────────────────────────────────────────────
 
 
-def wait_for_login(driver, base_url):
-    driver.get(f"{base_url}/ultra/course")
+def wait_for_login(page, base_url):
+    page.goto(f"{base_url}/ultra/course")
     print("\nA browser window has opened.")
     print("Please log in to Blackboard, then come back here and press Enter.")
     input()
 
 
-def get_session_from_browser(driver):
+def get_session_from_browser(context):
     session = requests.Session()
-    for cookie in driver.get_cookies():
+    for cookie in context.cookies():
         session.cookies.set(
             cookie["name"], cookie["value"], domain=cookie.get("domain")
         )
@@ -100,7 +97,7 @@ def build_term_map(session, base_url, enrollments):
         if not detail:
             continue
 
-        course_code = detail.get("courseId", "")  # e.g. "26sprgcasma225_c1"
+        course_code = detail.get("courseId", "")
         name = detail.get("name", "Unknown")
         term_label = (
             detail.get("term", {}).get("name")
@@ -193,7 +190,6 @@ def collect_files_recursive(session, base_url, course_id, item_id, extensions):
     files = []
 
     def fetch(node_id):
-        # Fetch node detail (contains body HTML)
         detail_resp = session.get(
             f"{base_url}/learn/api/public/v1/courses/{course_id}/contents/{node_id}"
         )
@@ -201,7 +197,6 @@ def collect_files_recursive(session, base_url, course_id, item_id, extensions):
             body = detail_resp.json().get("body", "")
             files.extend(_extract_from_body(body, base_url, extensions))
 
-        # Fetch traditional attachments
         att_resp = session.get(
             f"{base_url}/learn/api/public/v1/courses/{course_id}/contents/{node_id}/attachments"
         )
@@ -216,7 +211,6 @@ def collect_files_recursive(session, base_url, course_id, item_id, extensions):
                     )
                     files.append({"url": dl_url, "filename": filename})
 
-        # Recurse into children
         children_resp = session.get(
             f"{base_url}/learn/api/public/v1/courses/{course_id}/contents/{node_id}/children?limit=100"
         )
@@ -264,7 +258,6 @@ def _matches(filename, mime, extensions):
     ext = Path(filename).suffix.lower()
     if ext in extensions:
         return True
-    # fallback: check mime type for common types
     mime_map = {
         "application/pdf": ".pdf",
         "application/vnd.ms-powerpoint": ".ppt",
@@ -288,7 +281,6 @@ def download_file(session, url, dest_path: Path):
         print(f"    failed ({resp.status_code}): {dest_path.name}")
         return False
 
-    # Try to get real filename from Content-Disposition
     cd = resp.headers.get("Content-Disposition", "")
     if cd and "filename=" in cd:
         m = re.search(r'filename[^;=\n]*=([\'"]?)([^\'";\n]+)\1', cd)
@@ -378,39 +370,43 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
     print(f"Output folder: {output_dir}")
 
-    # Launch browser for login
-    options = Options()
-    driver = webdriver.Chrome(
-        service=Service(ChromeDriverManager().install()), options=options
-    )
+    # Launch Playwright browser context
+    with sync_playwright() as p:
+        # Default: uses Playwright's bundled Chromium
+        # To use Arc instead, add: executable_path="/Applications/Arc.app/Contents/MacOS/Arc"
+        browser = p.chromium.launch(headless=False)
+        context = browser.new_context()
+        page = context.new_page()
+
+        try:
+            wait_for_login(page, base_url)
+            session = get_session_from_browser(context)
+        finally:
+            browser.close()
+
+    print("\nFetching user info...")
+    user_id = get_my_user_id(session, base_url)
+    if not user_id:
+        print("Could not retrieve user ID. Login may have failed.")
+        return
+
+    print("Fetching enrollments...")
+    enrollments = get_all_enrollments(session, base_url, user_id)
+    if not enrollments:
+        print("No enrollments found.")
+        return
+
+    term_map = build_term_map(session, base_url, enrollments)
+    if not term_map:
+        print("No courses found.")
+        return
+
+    courses = pick_term(term_map)
+
+    print(f"\nStarting download for {len(courses)} course(s)...\n")
+    total = 0
 
     try:
-        wait_for_login(driver, base_url)
-        session = get_session_from_browser(driver)
-        driver.quit()
-
-        print("\nFetching user info...")
-        user_id = get_my_user_id(session, base_url)
-        if not user_id:
-            print("Could not retrieve user ID. Login may have failed.")
-            return
-
-        print("Fetching enrollments...")
-        enrollments = get_all_enrollments(session, base_url, user_id)
-        if not enrollments:
-            print("No enrollments found.")
-            return
-
-        term_map = build_term_map(session, base_url, enrollments)
-        if not term_map:
-            print("No courses found.")
-            return
-
-        courses = pick_term(term_map)
-
-        print(f"\nStarting download for {len(courses)} course(s)...\n")
-        total = 0
-
         for course in courses:
             print(f"[{course['name']}]")
             course_dir = output_dir / course["safe_name"]
@@ -435,11 +431,6 @@ def main():
 
     except KeyboardInterrupt:
         print("\nInterrupted.")
-    finally:
-        try:
-            driver.quit()
-        except Exception:
-            pass
 
 
 if __name__ == "__main__":
