@@ -298,13 +298,45 @@ def get_top_level_sections(session, base_url, course_id):
     return sections
 
 
+def _html_to_markdown(html_content):
+    """Convert Blackboard HTML body content into clean Markdown text."""
+    if not html_content:
+        return ""
+    soup = BeautifulSoup(html_content, "html.parser")
+    for script in soup(["script", "style"]):
+        script.decompose()
+
+    # Remove inline bbfile links since their attachments are downloaded separately
+    for a in soup.find_all("a", attrs={"data-bbfile": True}):
+        a.decompose()
+
+    for a in soup.find_all("a"):
+        href = a.get("href")
+        text = a.get_text().strip()
+        if isinstance(href, str):
+            if href and text:
+                a.replace_with(f"[{text}]({href})")
+            elif href:
+                a.replace_with(href)
+
+    for p in soup.find_all(["p", "div", "br", "li"]):
+        p.insert_after("\n")
+
+    text = soup.get_text()
+    lines = [line.strip() for line in text.splitlines()]
+    cleaned_text = "\n".join([line for line in lines if line])
+
+    if len(cleaned_text.strip()) < 3:
+        return ""
+    return cleaned_text
+
+
 def collect_files_recursive(
     session, base_url, course_id, item_id, extensions, call_counter=None
 ):
     """
-    Recursively collect all downloadable files under item_id.
-    Returns list of {"url": ..., "filename": ..., "rel_path": [folder, subfolder, ...]}
-    where rel_path mirrors the Blackboard folder/lesson hierarchy below item_id.
+    Recursively collect all downloadable files and descriptive post bodies under item_id.
+    Ties items and their attachments together in a dedicated subfolder named after the item title.
     """
     files = []
 
@@ -314,11 +346,17 @@ def collect_files_recursive(
         detail_resp = session.get(
             f"{base_url}/learn/api/public/v1/courses/{course_id}/contents/{node_id}"
         )
+
+        item_rel_path = list(rel_path)
+        attachments = []
+        md_content = ""
+        title = ""
+
         if detail_resp.status_code == 200:
-            body = detail_resp.json().get("body", "")
-            for f in _extract_from_body(body, base_url, extensions):
-                f["rel_path"] = list(rel_path)
-                files.append(f)
+            item_data = detail_resp.json()
+            title = item_data.get("title", "")
+            body = item_data.get("body", "")
+            md_content = _html_to_markdown(body)
 
         if call_counter is not None:
             call_counter[0] += 1
@@ -334,13 +372,48 @@ def collect_files_recursive(
                         f"{base_url}/learn/api/public/v1/courses/{course_id}"
                         f"/contents/{node_id}/attachments/{att['id']}/download"
                     )
-                    files.append(
+                    attachments.append(
                         {
+                            "type": "file",
                             "url": dl_url,
                             "filename": filename,
-                            "rel_path": list(rel_path),
                         }
                     )
+
+        # If this content item has a title and contains either text or attachments,
+        # group them together in a subfolder named after the item title.
+        if title and (md_content or attachments):
+            item_rel_path = rel_path + [_safe(title)]
+            if md_content:
+                files.append(
+                    {
+                        "type": "text",
+                        "content": md_content,
+                        "filename": f"{_safe(title)}.md",
+                        "rel_path": list(item_rel_path),
+                    }
+                )
+        else:
+            if md_content and title:
+                files.append(
+                    {
+                        "type": "text",
+                        "content": md_content,
+                        "filename": f"{_safe(title)}.md",
+                        "rel_path": list(rel_path),
+                    }
+                )
+
+        for att_item in attachments:
+            att_item["rel_path"] = list(item_rel_path)
+            files.append(att_item)
+
+        if detail_resp.status_code == 200:
+            for f in _extract_from_body(
+                item_data.get("body", ""), base_url, extensions
+            ):
+                f["rel_path"] = list(item_rel_path)
+                files.append(f)
 
         if call_counter is not None:
             call_counter[0] += 1
@@ -353,8 +426,8 @@ def collect_files_recursive(
                 if not child_id:
                     continue
                 handler = (child.get("contentHandler") or {}).get("id", "")
+                child_name = _safe(child.get("title", "Untitled"))
                 if handler in FOLDER_HANDLERS:
-                    child_name = _safe(child.get("title", "Untitled"))
                     fetch(child_id, rel_path + [child_name])
                 else:
                     fetch(child_id, rel_path)
@@ -379,7 +452,7 @@ def _extract_from_body(body, base_url, extensions):
                 mime = info.get("mimeType", "")
                 url = info.get("resourceUrl") or a.get("href", "")
                 if url and _matches(filename, mime, extensions):
-                    files.append({"url": url, "filename": filename})
+                    files.append({"type": "file", "url": url, "filename": filename})
             except json.JSONDecodeError:
                 pass
             except AttributeError:
@@ -392,7 +465,9 @@ def _extract_from_body(body, base_url, extensions):
 
         filename = unquote(urlparse(href).path.split("/")[-1])
         if _matches(filename, "", extensions):
-            files.append({"url": urljoin(base_url, href), "filename": filename})
+            files.append(
+                {"type": "file", "url": urljoin(base_url, href), "filename": filename}
+            )
 
     return files
 
@@ -454,7 +529,7 @@ Examples:
             ".tex",
         ],
         help=(
-            "File extensions to download, e.g. --ext .pdf .pptx .docx"
+            "File extensions to download, e.g. --ext .pdf .pptx .docx "
             "(default: .pdf .pptx .docx .zip .py .ipynb .cpp .h .c .m .tex)"
         ),
     )
@@ -575,7 +650,6 @@ def main():
         BarColumn(bar_width=None),
     )
 
-    # Group them together under a single live context
     progress_group = Group(overall_progress, collection_progress)
 
     try:
@@ -628,7 +702,9 @@ def main():
                                 )
                                 tasks_found.append(
                                     {
-                                        "url": f["url"],
+                                        "type": f.get("type", "file"),
+                                        "url": f.get("url"),
+                                        "content": f.get("content"),
                                         "dest": dest,
                                         "course": course["name"],
                                         "section": section["name"],
@@ -668,7 +744,6 @@ def main():
 
     total_collection_time = time.time() - total_collection_start
 
-    # Print summary table after collection completes
     if course_stats:
         max_name_len = max((len(s["name"]) for s in course_stats), default=11)
         header = f"{'Course Name':<{max_name_len}} | {'Files Discovered':>16} | {'Links Visited':>13} | {'Time':>8} | {'Avg Load':>9}"
@@ -698,12 +773,12 @@ def main():
         return
 
     print(
-        f"\nTotal: {len(new_files)} files not already downloaded, {len(existing_files)} files downloaded previously."
+        f"\nTotal: {len(new_files)} new items discovered, {len(existing_files)} items have been downloaded previously."
     )
 
     print("\nOptions:")
-    print("  [1] Download ONLY new files")
-    print("  [2] Download new AND overwrite existing files")
+    print("  [1] Download only NEW items")
+    print("  [2] Download all items, and OVERWRITE existing files")
     print("  [3] Cancel")
 
     tasks_to_run = []
@@ -724,19 +799,18 @@ def main():
         print("Invalid choice, try again.")
 
     if not tasks_to_run:
-        print("No files to download. Exiting.")
+        print("No items to download. Exiting.")
         return
 
     # ── Phase 3: Concurrent Downloads ─────────────────────────
 
     print(
-        f"\nStarting {len(tasks_to_run)} download(s) using {args.concurrent_downloads} workers...\n"
+        f"\nStarting {len(tasks_to_run)} task(s) using {args.concurrent_downloads} workers...\n"
     )
     download_start = time.time()
     success_count = 0
     failure_count = 0
 
-    # Overall Progress (Tracks total files)
     overall_progress = Progress(
         TextColumn(
             "[bold green]{task.description}",
@@ -746,11 +820,10 @@ def main():
         BarColumn(bar_width=None),
         TextColumn("[progress.percentage]{task.percentage:>3.1f}%"),
         MofNCompleteColumn(table_column=Column(width=11, justify="right")),
-        TextColumn("[dim]Files", justify="left"),
+        TextColumn("[dim]Items", justify="left"),
         TimeRemainingColumn(table_column=Column(width=8, justify="right")),
     )
 
-    # Worker Progress (Tracks bytes per file)
     dl_progress = Progress(
         TextColumn(
             "[bold blue]{task.description}",
@@ -764,7 +837,6 @@ def main():
         TimeRemainingColumn(table_column=Column(width=8, justify="right")),
     )
 
-    # Group them together under a single live context
     progress_group = Group(overall_progress, dl_progress)
 
     try:
@@ -780,7 +852,7 @@ def main():
 
             def download_worker(task):
                 dest_path = task["dest"]
-                url = task["url"]
+                task_type = task.get("type", "file")
 
                 if dest_path.exists() and not overwrite:
                     overall_progress.advance(master_task)
@@ -801,37 +873,47 @@ def main():
 
                 success = False
                 try:
-                    resp = session.get(url, stream=True, allow_redirects=True)
-                    if resp.status_code == 200:
-                        cd = resp.headers.get("Content-Disposition", "")
-                        if cd and "filename=" in cd:
-                            m = re.search(
-                                r'filename[^;=\n]*=([\'"]?)([^\'";\n]+)\1', cd
-                            )
-                            if m:
-                                real_name = m.group(2).strip()
-                                if Path(real_name).suffix:
-                                    dest_path = dest_path.parent / _safe(real_name)
-
+                    if task_type == "text":
                         dest_path.parent.mkdir(parents=True, exist_ok=True)
-                        total_size = int(resp.headers.get("Content-Length", 0)) or None
-                        dl_progress.update(slot_id, total=total_size)
-
-                        with open(dest_path, "wb") as f:
-                            for chunk in resp.iter_content(chunk_size=8192):
-                                if chunk:
-                                    f.write(chunk)
-                                    dl_progress.advance(slot_id, len(chunk))
+                        with open(dest_path, "w", encoding="utf-8") as f:
+                            f.write(task["content"])
+                        dl_progress.update(slot_id, completed=1, total=1)
                         success = True
                     else:
-                        console.print(
-                            f"[red]Failed ({resp.status_code}): {display_name}[/red]",
-                            highlight=False,
-                        )
+                        url = task["url"]
+                        resp = session.get(url, stream=True, allow_redirects=True)
+                        if resp.status_code == 200:
+                            cd = resp.headers.get("Content-Disposition", "")
+                            if cd and "filename=" in cd:
+                                m = re.search(
+                                    r'filename[^;=\n]*=([\'"]?)([^\'";\n]+)\1', cd
+                                )
+                                if m:
+                                    real_name = m.group(2).strip()
+                                    if Path(real_name).suffix:
+                                        dest_path = dest_path.parent / _safe(real_name)
+
+                            dest_path.parent.mkdir(parents=True, exist_ok=True)
+                            total_size = (
+                                int(resp.headers.get("Content-Length", 0)) or None
+                            )
+                            dl_progress.update(slot_id, total=total_size)
+
+                            with open(dest_path, "wb") as f:
+                                for chunk in resp.iter_content(chunk_size=8192):
+                                    if chunk:
+                                        f.write(chunk)
+                                        dl_progress.advance(slot_id, len(chunk))
+                            success = True
+                        else:
+                            console.print(
+                                f"[red]Failed ({resp.status_code}): {display_name}[/red]",
+                                highlight=False,
+                            )
 
                 except (requests.RequestException, OSError) as e:
                     console.print(
-                        f"[red]Error downloading {display_name}: {e}[/red]",
+                        f"[red]Error processing {display_name}: {e}[/red]",
                         highlight=False,
                     )
 
@@ -856,12 +938,10 @@ def main():
     download_time = time.time() - download_start
     avg_dl_time = (download_time / len(tasks_to_run)) if tasks_to_run else 0
 
-    # ── Final Report ──────────────────────────────────────────────────────────
-
     print("\n=== Final Run Statistics ===")
     print(f"Collection Time:      {total_collection_time:.1f}s")
     print(f"Download Time:        {download_time:.1f}s")
-    print(f"Avg DL Time/File:     {avg_dl_time:.2f}s")
+    print(f"Avg Time/Item:        {avg_dl_time:.2f}s")
     print(f"Successful Downloads: {success_count}")
     if failure_count > 0:
         print(f"Failed/Skipped:       {failure_count}")
